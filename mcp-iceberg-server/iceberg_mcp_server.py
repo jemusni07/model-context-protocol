@@ -9,6 +9,9 @@ import json
 import os
 from tabulate import tabulate
 from typing import Dict, List, Optional, Any, Tuple
+from pyiceberg.io.pyarrow import schema_to_pyarrow
+import numpy as np
+from datetime import datetime
 
 # Create MCP server
 mcp = FastMCP("AWS Glue Iceberg Explorer")
@@ -49,34 +52,68 @@ def get_catalog():
         detailed_error += "Ensure your AWS credentials have appropriate permissions and Lake Formation is configured correctly."
         raise Exception(detailed_error)
 
-# ... rest of the code ...
 
-# Resources
-@mcp.resource("iceberg://databases")
-def list_databases() -> str:
-    """List all available databases in the catalog"""
+
+# Metadata Tools
+
+@mcp.tool()
+def get_table_snapshots(database: str, table: str) -> str:
+    """Get snapshot history for a specific table in a nicely formatted table"""
+    try:
+        catalog = get_catalog()
+        table_obj = catalog.load_table(f"{database}.{table}")
+        snapshots = table_obj.inspect.snapshots()
+        
+        # Convert PyArrow table to pandas DataFrame
+        df = snapshots.to_pandas()
+        
+        if df.empty:
+            return f"No snapshots found for {database}.{table}"
+        
+        # Format the summary column for better readability
+        if 'summary' in df.columns:
+            df['summary'] = df['summary'].apply(
+                lambda x: dict(zip(x['key'], x['value'])) if isinstance(x, dict) and 'key' in x and 'value' in x else x
+            )
+            
+            # Extract key metrics from summary for better visualization
+            for metric in ['added-records', 'total-records', 'added-data-files']:
+                df[metric] = df['summary'].apply(
+                    lambda x: x.get(metric, 'N/A') if isinstance(x, dict) else 'N/A'
+                )
+        
+        # Select and reorder columns for better readability
+        display_cols = ['snapshot_id', 'parent_id', 'committed_at', 'operation', 
+                         'added-records', 'total-records', 'added-data-files']
+        display_df = df[display_cols] if all(col in df.columns for col in display_cols) else df
+        
+        # Create a header with table information
+        header = f"\nSnapshot History for {database}.{table}\n"
+        header += "=" * 80 + "\n"
+        
+        # Format as table using tabulate
+        table_formatted = tabulate(display_df, headers='keys', tablefmt='grid', showindex=False)
+        
+        return header + table_formatted
+    except Exception as e:
+        return f"Error getting table snapshots: {str(e)}"
+
+# Database and Table Query Tools
+    
+@mcp.tool()
+def list_databases():
     catalog = get_catalog()
     databases = catalog.list_namespaces()
     return json.dumps([{"name": db[0]} for db in databases])
 
-@mcp.resource("iceberg://tables/{database}")
+@mcp.tool()
 def list_tables(database: str) -> str:
     """List all tables in a specific database"""
     catalog = get_catalog()
     tables = catalog.list_tables(database)
     return json.dumps({"database": database, "tables": tables})
 
-@mcp.resource("iceberg://schema/{database}/{table}")
-def get_table_schema(database: str, table: str) -> str:
-    """Get schema details for a specific table"""
-    catalog = get_catalog()
-    table_obj = catalog.load_table(f"{database}.{table}")
-    schema = table_obj.schema()
-    fields = [{"name": field.name, "type": str(field.field_type), "required": field.required} 
-              for field in schema.fields]
-    return json.dumps({"database": database, "table": table, "schema": fields})
-
-@mcp.resource("iceberg://data/{database}/{table}/{limit}")
+@mcp.tool()
 def get_table_data(database: str, table: str, limit: str) -> str:
     """Get sample data from a specific table with limit"""
     try:
@@ -88,116 +125,16 @@ def get_table_data(database: str, table: str, limit: str) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-@mcp.resource("iceberg://snapshots/{database}/{table}")
-def get_table_snapshots(database: str, table: str) -> str:
-    """Get snapshot history for a specific table"""
+@mcp.tool()
+def get_table_schema(database: str, table: str) -> str:
+    """Get schema details for a specific table"""
     catalog = get_catalog()
     table_obj = catalog.load_table(f"{database}.{table}")
-    snapshots = table_obj.snapshots()
-    snapshot_info = [{
-        "snapshot_id": s.snapshot_id,
-        "parent_id": s.parent_id,
-        "timestamp": s.timestamp_ms,
-        "operation": s.operation
-    } for s in snapshots]
-    return json.dumps({"database": database, "table": table, "snapshots": snapshot_info})
+    schema = table_obj.schema()
+    fields = [{"name": field.name, "type": str(field.field_type), "required": field.required} 
+              for field in schema.fields]
+    return json.dumps({"database": database, "table": table, "schema": fields})
 
-# Tools
-@mcp.tool()
-def create_table(database: str, table_name: str, schema_json: str) -> str:
-    """
-    Create a new Iceberg table with specified schema. if there are errors, show the error verbose form
-    
-    Args:
-        database: Database name
-        table_name: Table name to create
-        schema_json: JSON string describing the schema (format: [{"name": "col1", "type": "string", "required": true}])
-    """
-    try:
-        schema_list = json.loads(schema_json)
-        fields = []
-        
-        for field in schema_list:
-            field_type = None
-            if field["type"] == "string":
-                field_type = pa.string()
-            elif field["type"] == "int" or field["type"] == "integer":
-                field_type = pa.int32()
-            elif field["type"] == "long":
-                field_type = pa.int64()
-            elif field["type"] == "float":
-                field_type = pa.float32()
-            elif field["type"] == "double":
-                field_type = pa.float64()
-            elif field["type"] == "boolean":
-                field_type = pa.bool_()
-            
-            if field_type:
-                fields.append(pa.field(field["name"], field_type, nullable=not field.get("required", False)))
-        
-        schema = pa.schema(fields)
-        
-        catalog = get_catalog()
-        catalog.create_table(
-            identifier=f"{database}.{table_name}",
-            schema=schema
-        )
-        
-        return f"Table {database}.{table_name} created successfully"
-    except Exception as e:
-        return f"Error creating table: {str(e)}"
-
-@mcp.tool()
-def insert_data(database: str, table_name: str, data_json: str) -> str:
-    """
-    Insert data into an Iceberg table
-    
-    Args:
-        database: Database name
-        table_name: Table name
-        data_json: JSON string with rows to insert ([{"col1": "val1"}, {"col1": "val2"}])
-    """
-    try:
-        catalog = get_catalog()
-        table = catalog.load_table(f"{database}.{table_name}")
-        data = json.loads(data_json)
-        
-        # Convert to PyArrow table
-        df = pd.DataFrame(data)
-        arrow_table = pa.Table.from_pandas(df)
-        
-        # Append data
-        table.append(arrow_table)
-        
-        return f"Inserted {len(data)} rows into {database}.{table_name}"
-    except Exception as e:
-        return f"Error inserting data: {str(e)}"
-
-@mcp.tool()
-def update_data(database: str, table_name: str, data_json: str) -> str:
-    """
-    Overwrite data in an Iceberg table
-    
-    Args:
-        database: Database name
-        table_name: Table name
-        data_json: JSON string with rows to update ([{"col1": "val1"}, {"col1": "val2"}])
-    """
-    try:
-        catalog = get_catalog()
-        table = catalog.load_table(f"{database}.{table_name}")
-        data = json.loads(data_json)
-        
-        # Convert to PyArrow table
-        df = pd.DataFrame(data)
-        arrow_table = pa.Table.from_pandas(df)
-        
-        # Overwrite data
-        table.overwrite(arrow_table)
-        
-        return f"Updated {database}.{table_name} with {len(data)} rows"
-    except Exception as e:
-        return f"Error updating data: {str(e)}"
 
 @mcp.tool()
 def query_table(database: str, table_name: str, column: str, value: str, limit: int = 10) -> str:
@@ -224,125 +161,316 @@ def query_table(database: str, table_name: str, column: str, value: str, limit: 
     except Exception as e:
         return f"Error querying data: {str(e)}"
 
+
+
+# Table Operation Tools
+
+
+def _create_table_internal(database: str, table_name: str, schema_list: list) -> str:
+    """Internal implementation to create a table with the given schema list"""
+    # Make sure we have a list
+    if not isinstance(schema_list, list):
+        return "Error: Schema must be a list of column definitions"
+    
+    # Import PyArrow
+    import pyarrow as pa
+    
+    # Convert to PyArrow fields
+    pa_fields = []
+    for field in schema_list:
+        field_name = field["name"]
+        field_type_str = field["type"].lower()
+        nullable = not field.get("required", False)
+        
+        # Map type strings to PyArrow types
+        field_type = None
+        if field_type_str == "string":
+            field_type = pa.string()
+        elif field_type_str in ["int", "integer"]:
+            field_type = pa.int32()
+        elif field_type_str == "long":
+            field_type = pa.int64()
+        elif field_type_str == "float":
+            field_type = pa.float32()
+        elif field_type_str == "double":
+            field_type = pa.float64()
+        elif field_type_str in ["boolean", "bool"]:
+            field_type = pa.bool_()
+        elif field_type_str == "timestamp":
+            field_type = pa.timestamp('ms')
+        elif field_type_str == "date":
+            field_type = pa.date32()
+        
+        if field_type:
+            pa_fields.append(pa.field(field_name, field_type, nullable=nullable))
+        else:
+            return f"Error: Unsupported field type '{field_type_str}' for field '{field_name}'"
+    
+    # Create PyArrow schema
+    pa_schema = pa.schema(pa_fields)
+    
+    # Get catalog and create table using PyArrow schema
+    catalog = get_catalog()
+    catalog.create_table(
+        identifier=f"{database}.{table_name}",
+        schema=pa_schema
+    )
+    
+    # Build response with details
+    response = f"Table {database}.{table_name} created successfully\n"
+    response += f"Schema: {len(pa_fields)} fields\n"
+    for field in pa_fields:
+        nullable_str = "nullable" if field.nullable else "required"
+        response += f"  - {field.name} ({field.type}, {nullable_str})\n"
+        
+    return response
+
+def _create_table_with_identifiers(database: str, table_name: str, schema_list: list, identifier_fields: list) -> str:
+    """Create a table with identifier fields using PyIceberg Schema"""
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import (
+        BooleanType, IntegerType, LongType, FloatType, DoubleType, 
+        DateType, TimestampType, StringType, NestedField
+    )
+    
+    # Map type strings to PyIceberg types
+    type_mapping = {
+        "string": StringType,
+        "int": IntegerType,
+        "integer": IntegerType,
+        "long": LongType,
+        "float": FloatType,
+        "double": DoubleType,
+        "boolean": BooleanType,
+        "bool": BooleanType,
+        "timestamp": TimestampType,
+        "date": DateType,
+    }
+    
+    # Create nested fields for the schema
+    nested_fields = []
+    field_id = 1  # Start with field_id 1
+    field_id_map = {}  # Maps field names to field IDs
+    
+    for field in schema_list:
+        field_name = field["name"]
+        field_type_str = field["type"].lower()
+        is_required = field.get("required", False)
+        
+        if field_type_str in type_mapping:
+            nested_fields.append(
+                NestedField(
+                    field_id=field_id,
+                    name=field_name,
+                    field_type=type_mapping[field_type_str](),
+                    required=is_required
+                )
+            )
+            field_id_map[field_name] = field_id
+            field_id += 1
+        else:
+            return f"Error: Unsupported field type '{field_type_str}' for field '{field_name}'"
+    
+    # Validate that all identifier fields exist in the schema
+    identifier_field_ids = []
+    for field_name in identifier_fields:
+        if field_name in field_id_map:
+            identifier_field_ids.append(field_id_map[field_name])
+        else:
+            return f"Error: Identifier field '{field_name}' not found in schema"
+    
+    # Create the PyIceberg Schema
+    schema = Schema(*nested_fields, identifier_field_ids=identifier_field_ids)
+    
+    # Get catalog and create table
+    catalog = get_catalog()
+    catalog.create_table(
+        identifier=f"{database}.{table_name}",
+        schema=schema
+    )
+    
+    # Build response with details
+    response = f"Table {database}.{table_name} created successfully\n"
+    response += f"Schema: {len(nested_fields)} fields\n"
+    for field in schema_list:
+        required = "required" if field.get("required", False) else "optional"
+        response += f"  - {field['name']} ({field['type']}, {required})\n"
+    
+    response += f"\nIdentifier Fields: {', '.join(identifier_fields)}\n"
+    
+    return response
+
+
 @mcp.tool()
-def time_travel(database: str, table_name: str, snapshot_id: Optional[str] = None, timestamp_ms: Optional[int] = None) -> str:
+def create_table(database: str, table_name: str, schema: list, identifier_fields: list = None) -> str:
     """
-    Perform time travel on an Iceberg table.
+    Create a new Iceberg table with specified schema and optional identifier fields (primary keys).
+    
+    Args:
+        database: Database name
+        table_name: Table name to create
+        schema: List of dictionaries describing the schema (e.g. [{"name": "col1", "type": "string", "required": true}])
+        identifier_fields: Optional list of field names to use as identifier fields (primary keys)
+    """
+    try:
+        # If identifier fields are provided, use PyIceberg Schema approach
+        if identifier_fields and len(identifier_fields) > 0:
+            return _create_table_with_identifiers(database, table_name, schema, identifier_fields)
+        else:
+            # Otherwise use the PyArrow approach
+            return _create_table_internal(database, table_name, schema)
+    except Exception as e:
+        import traceback
+        error_msg = f"Error creating table: {str(e)}\n\n"
+        error_msg += traceback.format_exc()
+        return error_msg
+
+
+
+@mcp.tool()
+def insert_data(database: str, table_name: str, data: list) -> str:
+    """
+    Insert data into an Iceberg table, automatically updating existing records and inserting new ones.
     
     Args:
         database: Database name
         table_name: Table name
-        snapshot_id: (Optional) Specific snapshot ID to read
-        timestamp_ms: (Optional) Timestamp in milliseconds to read as of
-    """
-    try:
-        catalog = get_catalog()
-        table_identifier = f"{database}.{table_name}"
-        
-        if snapshot_id:
-            # Time travel to specific snapshot
-            table = catalog.load_table(table_identifier, snapshot_id=int(snapshot_id))
-        elif timestamp_ms:
-            # Time travel to specific timestamp
-            table = catalog.load_table(table_identifier, as_of_time=int(timestamp_ms))
-        else:
-            return "Either snapshot_id or timestamp_ms must be provided"
-            
-        # Get data from historical state
-        data = table.scan().to_pandas()
-        
-        return data.to_json(orient="records")
-    except Exception as e:
-        return f"Error during time travel: {str(e)}"
-
-@mcp.tool()
-def list_catalog_databases() -> str:
-    """
-    List all existing databases in the catalog with detailed information. 
+        data: List of records to insert or update
+              (e.g. [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
     
-    Returns:
-        A formatted string listing all databases in the catalog with their details or return verbose error.
-    """ 
+    Note:
+        This function uses upsert which requires identifier fields (primary keys) to be defined on the table.
+        If no identifier fields are defined, all records will be inserted as new rows.
+    """
     try:
+        # Validate input
+        if not isinstance(data, list):
+            return "Error: Data must be a list of records"
+        
+        if len(data) == 0:
+            return "Error: Data list is empty, nothing to insert"
+        
+        # Get the catalog and table
         catalog = get_catalog()
-        databases = catalog.list_namespaces()
+        table = catalog.load_table(f"{database}.{table_name}")
         
-        if not databases:
-            return "No databases found in the catalog."
+        # Get the Iceberg table schema
+        iceberg_schema = table.schema()
         
-        # Get more details about the connection
-        sts_client = boto3.client('sts')
-        account_id = sts_client.get_caller_identity()["Account"]
+        # Convert Iceberg schema to PyArrow schema
+        arrow_schema = schema_to_pyarrow(iceberg_schema)
         
-        result = f"AWS Account: {account_id}\n"
-        result += f"Catalog: {CATALOG}\n"
-        result += f"Region: {REGION}\n"
-        result += f"Role ARN: {LF_ROLE_ARN}\n\n"
-        result += "Databases in catalog:\n"
+        # Create a dictionary of column types for conversion
+        column_types = {field.name: field.type for field in arrow_schema}
         
-        for i, db in enumerate(databases, 1):
-            result += f"{i}. {db[0]}\n"
+        # Convert data to a pandas DataFrame first
+        df = pd.DataFrame(data)
         
-        return result
+        # Make sure DataFrame columns match the expected schema
+        expected_columns = [field.name for field in arrow_schema]
+        missing_columns = [col for col in expected_columns if col not in df.columns]
+        extra_columns = [col for col in df.columns if col not in expected_columns]
+        
+        # Handle missing columns
+        for col in missing_columns:
+            df[col] = None
+        
+        # Remove extra columns
+        if extra_columns:
+            df = df.drop(columns=extra_columns)
+            
+        # Reorder columns to match schema
+        df = df[expected_columns]
+        
+        # Apply type conversions based on schema
+        for col in df.columns:
+            if col in column_types:
+                col_type = column_types[col]
+                
+                # Handle date conversion
+                if pa.types.is_date(col_type):
+                    try:
+                        # Try to convert string dates to proper date objects
+                        df[col] = pd.to_datetime(df[col]).dt.date
+                    except Exception as e:
+                        return f"Error converting column '{col}' to date: {str(e)}"
+                
+                # Handle timestamp conversion
+                elif pa.types.is_timestamp(col_type):
+                    try:
+                        # Convert string timestamps to proper timestamp objects
+                        df[col] = pd.to_datetime(df[col])
+                    except Exception as e:
+                        return f"Error converting column '{col}' to timestamp: {str(e)}"
+                
+                # Handle integer conversion
+                elif pa.types.is_integer(col_type):
+                    try:
+                        # Fill NaN with None before conversion to avoid errors
+                        df[col] = df[col].replace({np.nan: None})
+                        # Only convert non-null values
+                        df.loc[df[col].notna(), col] = df.loc[df[col].notna(), col].astype(int)
+                    except Exception as e:
+                        return f"Error converting column '{col}' to integer: {str(e)}"
+                
+                # Handle floating point conversion
+                elif pa.types.is_floating(col_type):
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except Exception as e:
+                        return f"Error converting column '{col}' to float: {str(e)}"
+                
+                # Handle boolean conversion
+                elif pa.types.is_boolean(col_type):
+                    try:
+                        # Convert string representations to boolean
+                        bool_map = {'true': True, 'false': False, '1': True, '0': False, 
+                                   'yes': True, 'no': False, 'y': True, 'n': False}
+                        df[col] = df[col].map(lambda x: bool_map.get(str(x).lower(), x) if pd.notna(x) else None)
+                    except Exception as e:
+                        return f"Error converting column '{col}' to boolean: {str(e)}"
+        
+        # Convert DataFrame to Arrow table with the correct schema
+        try:
+            arrow_table = pa.Table.from_pandas(df, schema=arrow_schema)
+        except Exception as e:
+            return f"Error converting data to Arrow table: {str(e)}\n\nData types in DataFrame:\n{df.dtypes}"
+        
+        # Check if the table has identifier fields defined
+        identifier_fields = iceberg_schema.identifier_field_ids
+        
+        # Always use upsert which will handle both operations
+        try:
+            result = table.upsert(arrow_table)
+            
+            # Provide feedback
+            message = f"Operation completed for {database}.{table_name}:\n"
+            message += f"- New records inserted: {result.rows_inserted}\n"
+            message += f"- Existing records updated: {result.rows_updated}\n"
+            
+            if not identifier_fields:
+                message += "\nNote: This table has no identifier fields defined, so all records were inserted as new rows.\n"
+                message += "To enable updates, define identifier fields when creating the table.\n"
+                
+            if missing_columns:
+                message += f"\nNote: The following columns were missing in your data and set to NULL: {', '.join(missing_columns)}\n"
+                
+            if extra_columns:
+                message += f"\nNote: The following extra columns were ignored: {', '.join(extra_columns)}\n"
+                
+            return message
+        except AttributeError:
+            # If upsert is not available, fall back to append
+            table.append(arrow_table)
+            return f"Successfully appended {len(data)} records to {database}.{table_name} (upsert not available)"
+            
     except Exception as e:
         import traceback
-        error_details = f"Error listing databases: {str(e)}\n\n"
-        error_details += f"Error type: {type(e).__name__}\n"
-        error_details += f"Error details: {str(e)}\n\n"
-        error_details += "Traceback:\n"
+        error_details = f"Error processing data: {str(e)}\n\n"
         error_details += traceback.format_exc()
-        error_details += "\n\nEnvironment:\n"
-        error_details += f"AWS_DEFAULT_REGION: {REGION}\n"
-        error_details += f"CATALOG: {CATALOG}\n"
-        error_details += f"DATABASE: {DATABASE}\n"
-        error_details += f"TABLE_BUCKET: {TABLE_BUCKET}\n"
-        error_details += f"LF_ROLE_ARN: {LF_ROLE_ARN}\n"
         return error_details
 
-# Prompts
-@mcp.prompt()
-def create_table_prompt() -> str:
-    """Create a new Iceberg table"""
-    return """
-I'd like to create a new Iceberg table. Please use the create_table tool with the following arguments:
-- database: The database name
-- table_name: A descriptive name for the table
-- schema_json: A JSON array describing the columns, e.g.:
-[
-  {"name": "id", "type": "int", "required": true},
-  {"name": "name", "type": "string", "required": true},
-  {"name": "age", "type": "int", "required": false},
-  {"name": "email", "type": "string", "required": false}
-]
-"""
 
-@mcp.prompt()
-def insert_data_prompt() -> str:
-    """Insert data into an Iceberg table"""
-    return """
-I'd like to insert data into an Iceberg table. Please use the insert_data tool with the following arguments:
-- database: The database name
-- table_name: The table name
-- data_json: A JSON array with the data to insert, e.g.:
-[
-  {"id": 1, "name": "Alice", "age": 30, "email": "alice@example.com"},
-  {"id": 2, "name": "Bob", "age": 25, "email": "bob@example.com"}
-]
-"""
-
-@mcp.prompt()
-def time_travel_prompt() -> str:
-    """Perform time travel on an Iceberg table"""
-    return """
-I'd like to travel back in time to view a previous version of an Iceberg table. Please use the time_travel tool with:
-- database: The database name
-- table_name: The table name
-
-And either:
-- snapshot_id: The specific snapshot ID to read
-or
-- timestamp_ms: A timestamp in milliseconds (epoch time) to read as of that point in time
-"""
 
 if __name__ == "__main__":
     mcp.run()
